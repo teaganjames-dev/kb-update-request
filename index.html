@@ -29,14 +29,40 @@
   .field { margin-bottom: 20px; }
   label { display: block; font-size: 13px; font-weight: 600; color: #333; margin-bottom: 6px; }
   label .req { color: #e05; margin-left: 2px; }
-  input, select, textarea {
+  input, textarea {
+    width: 100%; padding: 10px 14px; border: 1.5px solid #e0e0e0;
+    border-radius: 8px; font-size: 14px; color: #111; background: #fff;
+    transition: border-color 0.15s;
+  }
+  input:focus, textarea:focus { outline: none; border-color: #5b5ef4; }
+  textarea { resize: vertical; min-height: 100px; line-height: 1.5; }
+
+  /* Searchable dropdown */
+  .dropdown-wrapper { position: relative; }
+  .dropdown-search {
     width: 100%; padding: 10px 14px; border: 1.5px solid #e0e0e0;
     border-radius: 8px; font-size: 14px; color: #111; background: #fff;
     transition: border-color 0.15s; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23666' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 14px center;
+    cursor: text;
   }
-  input:focus, select:focus, textarea:focus { outline: none; border-color: #5b5ef4; }
-  select { cursor: pointer; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23666' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; padding-right: 36px; }
-  textarea { resize: vertical; min-height: 100px; line-height: 1.5; }
+  .dropdown-search:focus { outline: none; border-color: #5b5ef4; }
+  .dropdown-list {
+    position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+    background: #fff; border: 1.5px solid #e0e0e0; border-radius: 8px;
+    max-height: 220px; overflow-y: auto; z-index: 100;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1); display: none;
+  }
+  .dropdown-list.open { display: block; }
+  .dropdown-item {
+    padding: 10px 14px; font-size: 14px; color: #111; cursor: pointer;
+    transition: background 0.1s;
+  }
+  .dropdown-item:hover, .dropdown-item.highlighted { background: #f0f0ff; color: #5b5ef4; }
+  .dropdown-item.no-results { color: #999; cursor: default; }
+  .dropdown-item.no-results:hover { background: none; color: #999; }
+
   .priority-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .priority-opt input[type="radio"] { display: none; }
   .priority-opt label {
@@ -70,10 +96,13 @@
   </div>
 
   <div class="field">
-    <label for="article">Article to Update <span class="req">*</span></label>
-    <select id="article">
-      <option value="" disabled selected>Loading articles…</option>
-    </select>
+    <label>Article to Update <span class="req">*</span></label>
+    <div class="dropdown-wrapper" id="dropdownWrapper">
+      <input type="text" class="dropdown-search" id="articleSearch" placeholder="Loading articles…" autocomplete="off" disabled />
+      <div class="dropdown-list" id="dropdownList"></div>
+    </div>
+    <input type="hidden" id="articleId" />
+    <input type="hidden" id="articleName" />
   </div>
 
   <div class="field">
@@ -108,33 +137,64 @@
 
 <script>
 const PROXY = '/.netlify/functions/clickup-proxy';
+let allTasks = [];
 
 async function loadArticles() {
-  const sel = document.getElementById('article');
+  const searchInput = document.getElementById('articleSearch');
   try {
     const res = await fetch(`${PROXY}?action=getTasks`);
     const data = await res.json();
-    sel.innerHTML = '<option value="" disabled selected>Select an article…</option>';
-    if (data.tasks && data.tasks.length) {
-      data.tasks.forEach(t => {
-        const opt = document.createElement('option');
-        opt.value = t.id;
-        opt.textContent = t.name;
-        sel.appendChild(opt);
-      });
-    } else {
-      sel.innerHTML = '<option value="" disabled selected>No articles found</option>';
-    }
+    allTasks = data.tasks || [];
+    searchInput.placeholder = allTasks.length ? 'Type to search articles…' : 'No articles found';
+    searchInput.disabled = false;
   } catch (e) {
-    sel.innerHTML = '<option value="" disabled selected>Failed to load — contact your admin</option>';
+    searchInput.placeholder = 'Failed to load — contact your admin';
   }
 }
 
+function renderList(filter) {
+  const list = document.getElementById('dropdownList');
+  const filtered = filter
+    ? allTasks.filter(t => t.name.toLowerCase().includes(filter.toLowerCase()))
+    : allTasks;
+
+  if (!filtered.length) {
+    list.innerHTML = '<div class="dropdown-item no-results">No matches found</div>';
+  } else {
+    list.innerHTML = filtered.map(t =>
+      `<div class="dropdown-item" data-id="${t.id}" data-name="${t.name.replace(/"/g,'&quot;')}">${t.name}</div>`
+    ).join('');
+    list.querySelectorAll('.dropdown-item:not(.no-results)').forEach(el => {
+      el.addEventListener('mousedown', () => selectItem(el.dataset.id, el.dataset.name));
+    });
+  }
+  list.classList.add('open');
+}
+
+function selectItem(id, name) {
+  document.getElementById('articleId').value = id;
+  document.getElementById('articleName').value = name;
+  document.getElementById('articleSearch').value = name;
+  document.getElementById('dropdownList').classList.remove('open');
+}
+
+const searchInput = document.getElementById('articleSearch');
+searchInput.addEventListener('focus', () => renderList(searchInput.value));
+searchInput.addEventListener('input', () => {
+  document.getElementById('articleId').value = '';
+  document.getElementById('articleName').value = '';
+  renderList(searchInput.value);
+});
+document.addEventListener('click', e => {
+  if (!document.getElementById('dropdownWrapper').contains(e.target)) {
+    document.getElementById('dropdownList').classList.remove('open');
+  }
+});
+
 async function handleSubmit() {
   const name = document.getElementById('name').value.trim();
-  const articleSel = document.getElementById('article');
-  const taskId = articleSel.value;
-  const articleName = articleSel.options[articleSel.selectedIndex]?.text || '';
+  const taskId = document.getElementById('articleId').value;
+  const articleName = document.getElementById('articleName').value;
   const description = document.getElementById('description').value.trim();
   const priority = document.querySelector('input[name="priority"]:checked')?.value || 'Medium';
   const btn = document.getElementById('submitBtn');
@@ -143,7 +203,7 @@ async function handleSubmit() {
   if (!name || !taskId || !description) {
     statusEl.style.display = 'block';
     statusEl.className = 'status error';
-    statusEl.textContent = 'Please fill out all required fields.';
+    statusEl.textContent = !taskId ? 'Please select an article from the list.' : 'Please fill out all required fields.';
     return;
   }
 
@@ -164,8 +224,10 @@ async function handleSubmit() {
       statusEl.className = 'status success';
       statusEl.textContent = '✅ Request submitted! An approver will review it in Slack shortly.';
       document.getElementById('name').value = '';
+      document.getElementById('articleSearch').value = '';
+      document.getElementById('articleId').value = '';
+      document.getElementById('articleName').value = '';
       document.getElementById('description').value = '';
-      articleSel.selectedIndex = 0;
       document.querySelector('input[value="Medium"]').checked = true;
     } else {
       throw new Error(result.error || 'Unknown error');
