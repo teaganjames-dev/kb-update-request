@@ -1,6 +1,7 @@
 // netlify/functions/slack-reaction.js
 // Listens for ✅ reactions in your Slack approvals channel
 // → updates the ClickUp task status to "UPDATE REQUESTED"
+// → posts the update description as a comment on the ClickUp task
 // → posts a confirmation reply in the Slack thread
 
 const crypto = require('crypto');
@@ -30,18 +31,34 @@ async function getSlackMessage(channel, ts) {
   return data.messages?.[0] || null;
 }
 
-function extractTaskId(message) {
+// Extract task ID, requester name, and update description from the Slack message blocks
+function parseMessage(message) {
+  let taskId = null, requester = null, description = null;
+
   const blocks = message.blocks || [];
   for (const block of blocks) {
+    // Task ID from context block footer
     if (block.type === 'context') {
       for (const el of block.elements || []) {
         const match = el.text?.match(/ClickUp Task ID: `([^`]+)`/);
-        if (match) return match[1];
+        if (match) taskId = match[1];
+      }
+    }
+    // Requester and description from section blocks
+    if (block.type === 'section') {
+      if (block.fields) {
+        for (const f of block.fields) {
+          const nameMatch = f.text?.match(/\*Requested by:\*\n(.+)/);
+          if (nameMatch) requester = nameMatch[1].trim();
+        }
+      }
+      if (block.text?.text) {
+        const descMatch = block.text.text.match(/\*What needs updating:\*\n([\s\S]+)/);
+        if (descMatch) description = descMatch[1].trim();
       }
     }
   }
-  const match = message.text?.match(/ClickUp Task ID: `([^`]+)`/);
-  return match ? match[1] : null;
+  return { taskId, requester, description };
 }
 
 async function updateClickUpStatus(taskId) {
@@ -53,6 +70,17 @@ async function updateClickUpStatus(taskId) {
   return res.ok;
 }
 
+// Post the update description as a comment on the ClickUp task
+async function postClickUpComment(taskId, requester, description) {
+  await fetch(`https://api.clickup.com/api/v2/task/${taskId}/comment`, {
+    method: 'POST',
+    headers: { Authorization: CLICKUP_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      comment_text: `📝 Update requested by ${requester}:\n\n${description}`
+    })
+  });
+}
+
 async function postThreadReply(channel, ts, approverUserId) {
   await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
@@ -60,7 +88,7 @@ async function postThreadReply(channel, ts, approverUserId) {
     body: JSON.stringify({
       channel,
       thread_ts: ts,
-      text: `✅ Approved by <@${approverUserId}> — ClickUp task status updated to *UPDATE REQUESTED*.`
+      text: `✅ Approved by <@${approverUserId}> — ClickUp task status updated to *UPDATE REQUESTED* and update description added as a comment.`
     })
   });
 }
@@ -71,7 +99,6 @@ exports.handler = async (event) => {
 
   const parsed = JSON.parse(rawBody);
 
-  // One-time Slack URL verification challenge
   if (parsed.type === 'url_verification') {
     return { statusCode: 200, body: JSON.stringify({ challenge: parsed.challenge }) };
   }
@@ -97,11 +124,16 @@ exports.handler = async (event) => {
     const message = await getSlackMessage(SLACK_CHANNEL_ID, ts);
     if (!message) return { statusCode: 200, body: 'Message not found' };
 
-    const taskId = extractTaskId(message);
+    const { taskId, requester, description } = parseMessage(message);
     if (!taskId) return { statusCode: 200, body: 'Task ID not found in message' };
 
     const updated = await updateClickUpStatus(taskId);
     if (!updated) return { statusCode: 500, body: 'ClickUp update failed' };
+
+    // Post description as a comment on the ClickUp task
+    if (requester && description) {
+      await postClickUpComment(taskId, requester, description);
+    }
 
     await postThreadReply(SLACK_CHANNEL_ID, ts, approverUserId);
 
