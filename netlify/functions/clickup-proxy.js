@@ -1,7 +1,6 @@
 // netlify/functions/clickup-proxy.js
-// Handles two actions:
-//   GET  ?action=getTasks      → fetches KB articles from ClickUp for the dropdown
-//   POST { action: submitRequest } → sets ClickUp priority + posts Slack message
+// GET  ?action=getTasks       → fetches KB articles for the dropdown
+// POST { action: submitRequest } → handles both new article and update requests
 
 const CLICKUP_TOKEN = process.env.CLICKUP_TOKEN;
 const CLICKUP_LIST_ID = process.env.CLICKUP_LIST_ID;
@@ -25,8 +24,7 @@ exports.handler = async (event) => {
 
   // GET — fetch tasks for dropdown
   if (event.httpMethod === 'GET') {
-    const action = event.queryStringParameters?.action;
-    if (action !== 'getTasks') {
+    if (event.queryStringParameters?.action !== 'getTasks') {
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'Unknown action' }) };
     }
     try {
@@ -35,8 +33,7 @@ exports.handler = async (event) => {
       });
       const data = await res.json();
       return {
-        statusCode: 200,
-        headers,
+        statusCode: 200, headers,
         body: JSON.stringify({ tasks: data.tasks?.map(t => ({ id: t.id, name: t.name })) || [] })
       };
     } catch (e) {
@@ -44,51 +41,80 @@ exports.handler = async (event) => {
     }
   }
 
-  // POST — set priority on ClickUp + post Slack message
+  // POST — handle form submission
   if (event.httpMethod === 'POST') {
     let body;
     try { body = JSON.parse(event.body); } catch {
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid JSON' }) };
     }
 
-    const { action, name, taskId, articleName, description, priority } = body;
-    if (action !== 'submitRequest' || !name || !taskId || !articleName || !description || !priority) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing required fields' }) };
+    const { action, reqType, name, taskId, articleName, articleTopic, description, priority } = body;
+    if (action !== 'submitRequest') {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Unknown action' }) };
     }
 
     try {
-      // 1. Set priority on ClickUp task
-      await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, {
-        method: 'PUT',
-        headers: { Authorization: CLICKUP_TOKEN, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ priority: PRIORITY_MAP[priority] })
-      });
+      if (reqType === 'update') {
+        // Set priority on existing ClickUp task
+        await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, {
+          method: 'PUT',
+          headers: { Authorization: CLICKUP_TOKEN, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ priority: PRIORITY_MAP[priority] })
+        });
 
-      // 2. Post to Slack
-      await fetch(SLACK_WEBHOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: `📝 *KB Update Request*`,
-          blocks: [
-            { type: 'header', text: { type: 'plain_text', text: '📝 KB Update Request', emoji: true } },
-            {
-              type: 'section',
-              fields: [
-                { type: 'mrkdwn', text: `*Requested by:*\n${name}` },
-                { type: 'mrkdwn', text: `*Priority:*\n${getPriorityEmoji(priority)} ${priority}` }
-              ]
-            },
-            { type: 'section', text: { type: 'mrkdwn', text: `*Article:*\n${articleName}` } },
-            { type: 'section', text: { type: 'mrkdwn', text: `*What needs updating:*\n${description}` } },
-            { type: 'divider' },
-            {
-              type: 'context',
-              elements: [{ type: 'mrkdwn', text: `React with ✅ to approve · ClickUp Task ID: \`${taskId}\`` }]
-            }
-          ]
-        })
-      });
+        // Post update request to Slack
+        await fetch(SLACK_WEBHOOK, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: `📝 KB Update Request`,
+            blocks: [
+              { type: 'header', text: { type: 'plain_text', text: '📝 KB Article Update Request', emoji: true } },
+              {
+                type: 'section',
+                fields: [
+                  { type: 'mrkdwn', text: `*Requested by:*\n${name}` },
+                  { type: 'mrkdwn', text: `*Priority:*\n${getPriorityEmoji(priority)} ${priority}` }
+                ]
+              },
+              { type: 'section', text: { type: 'mrkdwn', text: `*Article:*\n${articleName}` } },
+              { type: 'section', text: { type: 'mrkdwn', text: `*What needs updating:*\n${description}` } },
+              { type: 'divider' },
+              {
+                type: 'context',
+                elements: [{ type: 'mrkdwn', text: `React with ✅ to approve · Type: \`update\` · ClickUp Task ID: \`${taskId}\`` }]
+              }
+            ]
+          })
+        });
+
+      } else {
+        // New article request — post to Slack only (ClickUp task created on approval)
+        await fetch(SLACK_WEBHOOK, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: `🆕 New KB Article Request`,
+            blocks: [
+              { type: 'header', text: { type: 'plain_text', text: '🆕 New KB Article Request', emoji: true } },
+              {
+                type: 'section',
+                fields: [
+                  { type: 'mrkdwn', text: `*Requested by:*\n${name}` },
+                  { type: 'mrkdwn', text: `*Priority:*\n${getPriorityEmoji(priority)} ${priority}` }
+                ]
+              },
+              { type: 'section', text: { type: 'mrkdwn', text: `*Article Topic:*\n${articleTopic}` } },
+              { type: 'section', text: { type: 'mrkdwn', text: `*What should it cover:*\n${description}` } },
+              { type: 'divider' },
+              {
+                type: 'context',
+                elements: [{ type: 'mrkdwn', text: `React with ✅ to approve · Type: \`new\` · Topic: \`${articleTopic}\` · Requested by: \`${name}\` · Priority: \`${priority}\` · Description: \`${description}\`` }]
+              }
+            ]
+          })
+        });
+      }
 
       return { statusCode: 200, headers, body: JSON.stringify({ ok: true }) };
     } catch (e) {
