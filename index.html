@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>KB Update Request</title>
+<title>KB Article Request</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -36,6 +36,17 @@
   }
   input:focus, textarea:focus { outline: none; border-color: #5b5ef4; }
   textarea { resize: vertical; min-height: 100px; line-height: 1.5; }
+
+  /* Request type toggle */
+  .type-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 28px; }
+  .type-opt input[type="radio"] { display: none; }
+  .type-opt label {
+    display: block; text-align: center; padding: 12px 8px;
+    border: 1.5px solid #e0e0e0; border-radius: 8px; cursor: pointer;
+    font-size: 14px; font-weight: 600; color: #555; transition: all 0.15s; margin: 0;
+  }
+  .type-opt input:checked + label { border-color: #5b5ef4; background: #f0f0ff; color: #5b5ef4; }
+  .type-opt label:hover { border-color: #aaa; }
 
   /* Searchable dropdown */
   .dropdown-wrapper { position: relative; }
@@ -82,20 +93,36 @@
   .status { margin-top: 16px; padding: 12px 16px; border-radius: 8px; font-size: 14px; display: none; }
   .status.success { background: #edfbf3; color: #1a7f4b; border: 1px solid #b6eecf; }
   .status.error { background: #fff0f0; color: #c0392b; border: 1px solid #fcc; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
 <div class="card">
   <div class="logo">Nuvo · Knowledge Base</div>
-  <h1>Request an Article Update</h1>
-  <p class="subtitle">Submit a request to update an existing KB article. An approver will review your request in Slack before any changes begin.</p>
+  <h1 id="formTitle">KB Article Request</h1>
+  <p class="subtitle" id="formSubtitle">Submit a request for a new article or an update to an existing one. An approver will review your request in Slack before any changes begin.</p>
+
+  <div class="field">
+    <label>Request Type <span class="req">*</span></label>
+    <div class="type-toggle">
+      <div class="type-opt">
+        <input type="radio" name="reqType" id="type-new" value="new" />
+        <label for="type-new">🆕 New Article</label>
+      </div>
+      <div class="type-opt">
+        <input type="radio" name="reqType" id="type-update" value="update" checked />
+        <label for="type-update">📝 Update Existing</label>
+      </div>
+    </div>
+  </div>
 
   <div class="field">
     <label for="name">Your Name <span class="req">*</span></label>
     <input type="text" id="name" placeholder="First and last name" />
   </div>
 
-  <div class="field">
+  <!-- Existing article dropdown -->
+  <div class="field" id="existingField">
     <label>Article to Update <span class="req">*</span></label>
     <div class="dropdown-wrapper" id="dropdownWrapper">
       <input type="text" class="dropdown-search" id="articleSearch" placeholder="Loading articles…" autocomplete="off" disabled />
@@ -105,8 +132,14 @@
     <input type="hidden" id="articleName" />
   </div>
 
+  <!-- New article topic input -->
+  <div class="field hidden" id="newField">
+    <label for="articleTopic">Article Topic <span class="req">*</span></label>
+    <input type="text" id="articleTopic" placeholder="e.g. How to submit a credit application" />
+  </div>
+
   <div class="field">
-    <label for="description">What needs to be updated? <span class="req">*</span></label>
+    <label for="description" id="descLabel">What needs to be updated? <span class="req">*</span></label>
     <textarea id="description" placeholder="Describe the changes needed, including any relevant context or links…"></textarea>
   </div>
 
@@ -139,6 +172,21 @@
 const PROXY = '/.netlify/functions/clickup-proxy';
 let allTasks = [];
 
+// Toggle between new and update flows
+document.querySelectorAll('input[name="reqType"]').forEach(r => {
+  r.addEventListener('change', () => {
+    const isNew = r.value === 'new';
+    document.getElementById('existingField').classList.toggle('hidden', isNew);
+    document.getElementById('newField').classList.toggle('hidden', !isNew);
+    document.getElementById('descLabel').innerHTML = isNew
+      ? 'What should the article cover? <span class="req">*</span>'
+      : 'What needs to be updated? <span class="req">*</span>';
+    document.getElementById('description').placeholder = isNew
+      ? 'Describe the content, scope, and any relevant context or links…'
+      : 'Describe the changes needed, including any relevant context or links…';
+  });
+});
+
 async function loadArticles() {
   const searchInput = document.getElementById('articleSearch');
   try {
@@ -157,7 +205,6 @@ function renderList(filter) {
   const filtered = filter
     ? allTasks.filter(t => t.name.toLowerCase().includes(filter.toLowerCase()))
     : allTasks;
-
   if (!filtered.length) {
     list.innerHTML = '<div class="dropdown-item no-results">No matches found</div>';
   } else {
@@ -192,19 +239,32 @@ document.addEventListener('click', e => {
 });
 
 async function handleSubmit() {
+  const reqType = document.querySelector('input[name="reqType"]:checked').value;
   const name = document.getElementById('name').value.trim();
-  const taskId = document.getElementById('articleId').value;
-  const articleName = document.getElementById('articleName').value;
   const description = document.getElementById('description').value.trim();
   const priority = document.querySelector('input[name="priority"]:checked')?.value || 'Medium';
-  const btn = document.getElementById('submitBtn');
   const statusEl = document.getElementById('statusMsg');
+  const btn = document.getElementById('submitBtn');
 
-  if (!name || !taskId || !description) {
-    statusEl.style.display = 'block';
-    statusEl.className = 'status error';
-    statusEl.textContent = !taskId ? 'Please select an article from the list.' : 'Please fill out all required fields.';
-    return;
+  let taskId = '', articleName = '', articleTopic = '';
+
+  if (reqType === 'update') {
+    taskId = document.getElementById('articleId').value;
+    articleName = document.getElementById('articleName').value;
+    if (!name || !taskId || !description) {
+      statusEl.style.display = 'block';
+      statusEl.className = 'status error';
+      statusEl.textContent = !taskId ? 'Please select an article from the list.' : 'Please fill out all required fields.';
+      return;
+    }
+  } else {
+    articleTopic = document.getElementById('articleTopic').value.trim();
+    if (!name || !articleTopic || !description) {
+      statusEl.style.display = 'block';
+      statusEl.className = 'status error';
+      statusEl.textContent = 'Please fill out all required fields.';
+      return;
+    }
   }
 
   btn.disabled = true;
@@ -216,17 +276,20 @@ async function handleSubmit() {
     const res = await fetch(PROXY, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'submitRequest', name, taskId, articleName, description, priority })
+      body: JSON.stringify({ action: 'submitRequest', reqType, name, taskId, articleName, articleTopic, description, priority })
     });
     const result = await res.json();
     if (result.ok) {
       statusEl.style.display = 'block';
       statusEl.className = 'status success';
-      statusEl.textContent = '✅ Request submitted! An approver will review it in Slack shortly.';
+      statusEl.textContent = reqType === 'new'
+        ? '✅ New article request submitted! An approver will review it in Slack shortly.'
+        : '✅ Update request submitted! An approver will review it in Slack shortly.';
       document.getElementById('name').value = '';
       document.getElementById('articleSearch').value = '';
       document.getElementById('articleId').value = '';
       document.getElementById('articleName').value = '';
+      document.getElementById('articleTopic').value = '';
       document.getElementById('description').value = '';
       document.querySelector('input[value="Medium"]').checked = true;
     } else {
