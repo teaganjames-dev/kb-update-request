@@ -198,14 +198,19 @@ exports.handler = async (event) => {
 
   try {
     const message = await getSlackMessage(SLACK_CHANNEL_ID, ts);
-    if (!message) return { statusCode: 200, body: 'Message not found' };
+    if (!message) {
+      console.log('Exit: message not found', ts);
+      return { statusCode: 200, body: 'Message not found' };
+    }
 
     const info = parseMessage(message);
     if (info.reqType !== 'update' && info.reqType !== 'new') {
+      console.log('Exit: not a request message. Parsed:', JSON.stringify(info));
       return { statusCode: 200, body: 'Not a request message' };
     }
 
     if (await alreadyProcessed(SLACK_CHANNEL_ID, ts)) {
+      console.log('Exit: already processed', ts);
       return { statusCode: 200, body: 'Already processed' };
     }
 
@@ -247,7 +252,10 @@ exports.handler = async (event) => {
 
     // ===== NEW ARTICLE =====
     } else {
-      if (!info.topic) return { statusCode: 200, body: 'Article topic not found' };
+      if (!info.topic) {
+        console.log('Exit: article topic not found. Parsed:', JSON.stringify(info));
+        return { statusCode: 200, body: 'Article topic not found' };
+      }
 
       // Resolve the category dropdown option id (so the new task gets its category set)
       const extras = {};
