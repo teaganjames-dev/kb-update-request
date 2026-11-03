@@ -29,13 +29,18 @@
   .field { margin-bottom: 20px; }
   label { display: block; font-size: 13px; font-weight: 600; color: #333; margin-bottom: 6px; }
   label .req { color: #e05; margin-left: 2px; }
-  input, textarea {
+  input, textarea, select {
     width: 100%; padding: 10px 14px; border: 1.5px solid #e0e0e0;
     border-radius: 8px; font-size: 14px; color: #111; background: #fff;
     transition: border-color 0.15s;
   }
-  input:focus, textarea:focus { outline: none; border-color: #5b5ef4; }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: #5b5ef4; }
   textarea { resize: vertical; min-height: 100px; line-height: 1.5; }
+  select {
+    appearance: none; cursor: pointer; padding-right: 36px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23666' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 14px center;
+  }
 
   /* Request type toggle */
   .type-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 28px; }
@@ -99,8 +104,8 @@
 <body>
 <div class="card">
   <div class="logo">Nuvo · Knowledge Base</div>
-  <h1 id="formTitle">KB Article Request</h1>
-  <p class="subtitle" id="formSubtitle">Submit a request for a new article or an update to an existing one. An approver will review your request in Slack before any changes begin.</p>
+  <h1>KB Article Request</h1>
+  <p class="subtitle">Submit a request for a new article or an update to an existing one. The category owner and an approver will review your request in Slack before any work begins.</p>
 
   <div class="field">
     <label>Request Type <span class="req">*</span></label>
@@ -121,7 +126,7 @@
     <input type="text" id="name" placeholder="First and last name" />
   </div>
 
-  <!-- Existing article dropdown -->
+  <!-- Existing article: searchable dropdown -->
   <div class="field" id="existingField">
     <label>Article to Update <span class="req">*</span></label>
     <div class="dropdown-wrapper" id="dropdownWrapper">
@@ -132,10 +137,17 @@
     <input type="hidden" id="articleName" />
   </div>
 
-  <!-- New article topic input -->
+  <!-- New article: topic + category -->
   <div class="field hidden" id="newField">
     <label for="articleTopic">Article Topic <span class="req">*</span></label>
     <input type="text" id="articleTopic" placeholder="e.g. How to submit a credit application" />
+  </div>
+
+  <div class="field hidden" id="categoryField">
+    <label for="category">Category <span class="req">*</span></label>
+    <select id="category">
+      <option value="" disabled selected>Loading categories…</option>
+    </select>
   </div>
 
   <div class="field">
@@ -178,6 +190,7 @@ document.querySelectorAll('input[name="reqType"]').forEach(r => {
     const isNew = r.value === 'new';
     document.getElementById('existingField').classList.toggle('hidden', isNew);
     document.getElementById('newField').classList.toggle('hidden', !isNew);
+    document.getElementById('categoryField').classList.toggle('hidden', !isNew);
     document.getElementById('descLabel').innerHTML = isNew
       ? 'What should the article cover? <span class="req">*</span>'
       : 'What needs to be updated? <span class="req">*</span>';
@@ -197,6 +210,25 @@ async function loadArticles() {
     searchInput.disabled = false;
   } catch (e) {
     searchInput.placeholder = 'Failed to load — contact your admin';
+  }
+}
+
+async function loadCategories() {
+  const sel = document.getElementById('category');
+  try {
+    const res = await fetch(`${PROXY}?action=getCategories`);
+    const data = await res.json();
+    const cats = data.categories || [];
+    sel.innerHTML = '<option value="" disabled selected>Select a category…</option>';
+    cats.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.name;
+      opt.textContent = c.name;
+      sel.appendChild(opt);
+    });
+    if (!cats.length) sel.innerHTML = '<option value="" disabled selected>No categories found — contact your admin</option>';
+  } catch (e) {
+    sel.innerHTML = '<option value="" disabled selected>Failed to load — contact your admin</option>';
   }
 }
 
@@ -238,6 +270,13 @@ document.addEventListener('click', e => {
   }
 });
 
+function showError(msg) {
+  const statusEl = document.getElementById('statusMsg');
+  statusEl.style.display = 'block';
+  statusEl.className = 'status error';
+  statusEl.textContent = msg;
+}
+
 async function handleSubmit() {
   const reqType = document.querySelector('input[name="reqType"]:checked').value;
   const name = document.getElementById('name').value.trim();
@@ -246,24 +285,19 @@ async function handleSubmit() {
   const statusEl = document.getElementById('statusMsg');
   const btn = document.getElementById('submitBtn');
 
-  let taskId = '', articleName = '', articleTopic = '';
+  let taskId = '', articleName = '', articleTopic = '', category = '';
 
   if (reqType === 'update') {
     taskId = document.getElementById('articleId').value;
     articleName = document.getElementById('articleName').value;
     if (!name || !taskId || !description) {
-      statusEl.style.display = 'block';
-      statusEl.className = 'status error';
-      statusEl.textContent = !taskId ? 'Please select an article from the list.' : 'Please fill out all required fields.';
-      return;
+      return showError(!taskId ? 'Please select an article from the list.' : 'Please fill out all required fields.');
     }
   } else {
     articleTopic = document.getElementById('articleTopic').value.trim();
-    if (!name || !articleTopic || !description) {
-      statusEl.style.display = 'block';
-      statusEl.className = 'status error';
-      statusEl.textContent = 'Please fill out all required fields.';
-      return;
+    category = document.getElementById('category').value;
+    if (!name || !articleTopic || !category || !description) {
+      return showError(!category ? 'Please select a category.' : 'Please fill out all required fields.');
     }
   }
 
@@ -276,29 +310,28 @@ async function handleSubmit() {
     const res = await fetch(PROXY, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'submitRequest', reqType, name, taskId, articleName, articleTopic, description, priority })
+      body: JSON.stringify({ action: 'submitRequest', reqType, name, taskId, articleName, articleTopic, category, description, priority })
     });
     const result = await res.json();
     if (result.ok) {
       statusEl.style.display = 'block';
       statusEl.className = 'status success';
       statusEl.textContent = reqType === 'new'
-        ? '✅ New article request submitted! An approver will review it in Slack shortly.'
-        : '✅ Update request submitted! An approver will review it in Slack shortly.';
+        ? '✅ New article request submitted! The category owner and an approver will review it in Slack shortly.'
+        : '✅ Update request submitted! The category owner and an approver will review it in Slack shortly.';
       document.getElementById('name').value = '';
       document.getElementById('articleSearch').value = '';
       document.getElementById('articleId').value = '';
       document.getElementById('articleName').value = '';
       document.getElementById('articleTopic').value = '';
+      document.getElementById('category').selectedIndex = 0;
       document.getElementById('description').value = '';
       document.querySelector('input[value="Medium"]').checked = true;
     } else {
       throw new Error(result.error || 'Unknown error');
     }
   } catch (e) {
-    statusEl.style.display = 'block';
-    statusEl.className = 'status error';
-    statusEl.textContent = `Something went wrong: ${e.message}. Please try again or contact your admin.`;
+    showError(`Something went wrong: ${e.message}. Please try again or contact your admin.`);
   }
 
   btn.disabled = false;
@@ -307,6 +340,7 @@ async function handleSubmit() {
 }
 
 loadArticles();
+loadCategories();
 </script>
 </body>
 </html>
