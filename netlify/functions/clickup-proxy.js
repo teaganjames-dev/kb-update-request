@@ -74,7 +74,7 @@ function getCategoryFromTask(task) {
   if (!field || field.value === undefined || field.value === null) return null;
   const options = field.type_config?.options || [];
   const opt = options.find(o => o.id === field.value || String(o.orderindex) === String(field.value));
-  return opt ? opt.name : null;
+  return opt ? (opt.name ?? opt.label ?? null) : null;
 }
 
 async function fetchAllTasks() {
@@ -121,7 +121,7 @@ exports.handler = async (event) => {
         const res = await fetch(`https://api.clickup.com/api/v2/list/${CLICKUP_LIST_ID}/field`, { headers: CU });
         const data = await res.json();
         const field = (data.fields || []).find(f => norm(f.name) === norm(CATEGORY_FIELD_NAME));
-        const categories = (field?.type_config?.options || []).map(o => ({ id: o.id, name: o.name }));
+        const categories = (field?.type_config?.options || []).map(o => ({ id: o.id, name: o.name ?? o.label }));
         return { statusCode: 200, headers, body: JSON.stringify({ categories }) };
       } catch (e) {
         return { statusCode: 500, headers, body: JSON.stringify({ error: 'Failed to fetch categories' }) };

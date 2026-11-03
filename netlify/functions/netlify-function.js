@@ -253,7 +253,7 @@ exports.handler = async (event) => {
       const extras = {};
       if (info.category) {
         const field = await getCategoryField();
-        const opt = field?.type_config?.options?.find(o => norm(o.name) === norm(info.category));
+        const opt = field?.type_config?.options?.find(o => norm(o.name ?? o.label) === norm(info.category));
         if (field && opt) extras.custom_fields = [{ id: field.id, value: opt.id }];
         else warnings.push(`couldn't match the category "${info.category}" to the ClickUp dropdown`);
       }
