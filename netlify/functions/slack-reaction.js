@@ -5,12 +5,13 @@
 //   → status → "UPDATE REQUESTED", description added as a comment,
 //     category owner assigned to the task, Slack thread reply @mentioning the owner
 // NEW article requests:
-//   → creates a ClickUp task (status "NEW ARTICLE", priority, category, owner assigned),
-//     description added as a comment, Slack thread reply @mentioning the owner
+//   → creates a ClickUp task (NEW ARTICLE status, priority, owner assigned),
+//     sets the category, adds the description as a comment,
+//     Slack thread reply @mentioning the owner
 //
 // The owner's Slack ID and email are read from the Slack message itself
 // (clickup-proxy.js is the single source of truth for ownership).
-// Failures are reported in the Slack thread instead of failing silently.
+// Every step reports its own failure in the Slack thread instead of failing silently.
 
 const crypto = require('crypto');
 
@@ -23,12 +24,16 @@ const APPROVAL_EMOJI = 'white_check_mark';
 
 const PRIORITY_MAP = { High: 2, Medium: 3, Low: 4 };
 const CATEGORY_FIELD_NAME = 'Collection (Intercom)';
+const NEW_ARTICLE_STATUS = 'NEW ARTICLE';
 
 const CU = { Authorization: CLICKUP_TOKEN, 'Content-Type': 'application/json' };
 const SLACK_AUTH = { Authorization: `Bearer ${SLACK_BOT_TOKEN}` };
 
 const norm = s => String(s || '').toLowerCase().replace(/\s*::\s*/g, '::').replace(/\s+/g, ' ').trim();
+const loose = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 const unesc = s => String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+// Slack may return emails wrapped as <mailto:a@b.com|a@b.com>, so pull out just the address
+const emailOf = s => (String(s || '').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/) || [])[0] || null;
 
 // ---------- Slack helpers ----------
 
@@ -77,7 +82,7 @@ function parseMessage(message) {
         const t = el.text || '';
         out.reqType    = (t.match(/Type: `([^`]+)`/) || [])[1] || out.reqType;
         out.taskId     = (t.match(/ClickUp Task ID: `([^`]+)`/) || [])[1] || out.taskId;
-        out.ownerEmail = (t.match(/Owner: `([^`]+)`/) || [])[1] || out.ownerEmail;
+        out.ownerEmail = emailOf((t.match(/Owner: `([^`]+)`/) || [])[1]) || out.ownerEmail;
         const cat      = (t.match(/Category: `([^`]+)`/) || [])[1];
         if (cat) out.category = unesc(cat);
       }
@@ -108,20 +113,34 @@ async function getClickUpUserId(email) {
     const res = await fetch('https://api.clickup.com/api/v2/team', { headers: CU });
     const data = await res.json();
     memberCache = (data.teams || []).flatMap(t => (t.members || []).map(m => m.user)).filter(Boolean);
+    console.log(`ClickUp members visible: ${memberCache.length}`,
+      memberCache.map(u => `${u.username} <${u.email}>`).join('; '));
   }
-  const u = memberCache.find(u => (u.email || '').toLowerCase() === email.toLowerCase());
+  const want = email.toLowerCase();
+  let u = memberCache.find(x => (x.email || '').toLowerCase() === want);
+  if (!u) {
+    // Fallback: same name before the @, accepted only if it's unambiguous
+    const local = want.split('@')[0];
+    const matches = memberCache.filter(x => (x.email || '').toLowerCase().split('@')[0] === local);
+    if (matches.length === 1) u = matches[0];
+  }
   return u ? u.id : null;
-}
-
-async function getTask(taskId) {
-  const res = await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, { headers: CU });
-  return res.json();
 }
 
 async function getCategoryField() {
   const res = await fetch(`https://api.clickup.com/api/v2/list/${CLICKUP_LIST_ID}/field`, { headers: CU });
   const data = await res.json();
   return (data.fields || []).find(f => norm(f.name) === norm(CATEGORY_FIELD_NAME)) || null;
+}
+
+// Find the list's real status name that corresponds to NEW ARTICLE
+async function resolveNewArticleStatus() {
+  const res = await fetch(`https://api.clickup.com/api/v2/list/${CLICKUP_LIST_ID}`, { headers: CU });
+  const data = await res.json();
+  const statuses = (data.statuses || []).map(s => s.status);
+  const target = loose(NEW_ARTICLE_STATUS);
+  const status = statuses.find(s => loose(s) === target) || statuses.find(s => loose(s).includes(target)) || null;
+  return { status, statuses };
 }
 
 async function setStatus(taskId, status) {
@@ -145,25 +164,50 @@ async function postComment(taskId, text) {
   return res.ok;
 }
 
+// Set the category dropdown on a task. ClickUp has accepted both the option id and
+// the option's order index, so try the id first and then the index.
+async function setCategory(taskId, field, option) {
+  const url = `https://api.clickup.com/api/v2/task/${taskId}/field/${field.id}`;
+  let lastErr = '';
+  for (const value of [option.id, option.orderindex]) {
+    if (value === undefined || value === null) continue;
+    const res = await fetch(url, { method: 'POST', headers: CU, body: JSON.stringify({ value }) });
+    if (res.ok) return { ok: true };
+    lastErr = await res.text();
+    console.error('Set category failed with value', value, res.status, lastErr);
+  }
+  return { ok: false, err: lastErr };
+}
+
 // Create the task, degrading gracefully: full → without status → bare minimum.
-async function createClickUpTask(topic, priority, extras) {
+// Returns what had to be dropped so the thread reply can say so.
+async function createClickUpTask(topic, priority, assigneeId, statusName) {
   const url = `https://api.clickup.com/api/v2/list/${CLICKUP_LIST_ID}/task`;
   const base = { name: topic, priority: PRIORITY_MAP[priority] || 3 };
-  const attempts = [
-    { payload: { ...base, ...extras, status: 'NEW ARTICLE' }, skipped: null },
-    { payload: { ...base, ...extras }, skipped: 'the NEW ARTICLE status' },
-    { payload: base, skipped: 'the status, owner assignment and category' }
-  ];
+
+  const combos = [
+    { s: true, a: true }, { s: false, a: true }, { s: false, a: false }
+  ].filter(c => (!c.s || statusName) && (!c.a || assigneeId));
+
   const errors = [];
-  for (const a of attempts) {
-    const res = await fetch(url, { method: 'POST', headers: CU, body: JSON.stringify(a.payload) });
+  for (const c of combos) {
+    const payload = { ...base };
+    if (c.s) payload.status = statusName;
+    if (c.a) payload.assignees = [assigneeId];
+
+    const res = await fetch(url, { method: 'POST', headers: CU, body: JSON.stringify(payload) });
     const data = await res.json().catch(() => ({}));
-    if (res.ok && data.id) return { id: data.id, skipped: a.skipped, error: errors[0] || null };
+    if (res.ok && data.id) {
+      const lost = [];
+      if (statusName && !c.s) lost.push('status');
+      if (assigneeId && !c.a) lost.push('owner');
+      return { id: data.id, lost, errors };
+    }
     const err = data.err || JSON.stringify(data);
-    console.error(`ClickUp create failed (${a.skipped || 'full payload'}):`, res.status, err);
+    console.error('ClickUp create failed:', JSON.stringify(payload), res.status, err);
     errors.push(err);
   }
-  return { id: null, error: errors.join(' | ') };
+  return { id: null, lost: [], errors };
 }
 
 // ---------- Handler ----------
@@ -217,6 +261,7 @@ exports.handler = async (event) => {
     const ownerMention = info.ownerSlackId ? `<@${info.ownerSlackId}>` : null;
     const ownerUserId = await getClickUpUserId(info.ownerEmail);
     const warnings = [];
+    if (info.ownerEmail && !ownerUserId) warnings.push(`couldn't find a ClickUp user for ${info.ownerEmail}`);
 
     // ===== UPDATE =====
     if (info.reqType === 'update') {
@@ -239,8 +284,6 @@ exports.handler = async (event) => {
         const a = await assignTask(info.taskId, ownerUserId);
         assigned = a.ok;
         if (!a.ok) { console.error('Assign failed:', a.err); warnings.push("couldn't assign the owner in ClickUp"); }
-      } else if (info.ownerEmail) {
-        warnings.push(`couldn't find a ClickUp user for ${info.ownerEmail}`);
       }
 
       const parts = ['status set to *UPDATE REQUESTED*', 'description added as a comment'];
@@ -257,21 +300,41 @@ exports.handler = async (event) => {
         return { statusCode: 200, body: 'Article topic not found' };
       }
 
-      // Resolve the category dropdown option id (so the new task gets its category set)
-      const extras = {};
+      // Category dropdown option
+      let field = null, option = null;
       if (info.category) {
-        const field = await getCategoryField();
-        const opt = field?.type_config?.options?.find(o => norm(o.name ?? o.label) === norm(info.category));
-        if (field && opt) extras.custom_fields = [{ id: field.id, value: opt.id }];
-        else warnings.push(`couldn't match the category "${info.category}" to the ClickUp dropdown`);
+        field = await getCategoryField();
+        option = field?.type_config?.options?.find(o => norm(o.name ?? o.label) === norm(info.category)) || null;
+        if (!option) warnings.push(`couldn't match the category "${info.category}" to the ClickUp dropdown`);
       }
-      if (ownerUserId) extras.assignees = [ownerUserId];
-      else if (info.ownerEmail) warnings.push(`couldn't find a ClickUp user for ${info.ownerEmail}`);
 
-      const result = await createClickUpTask(info.topic, info.priority, extras);
+      // Real name of the NEW ARTICLE status on this list
+      const { status: statusName, statuses } = await resolveNewArticleStatus();
+      if (!statusName) {
+        warnings.push(`no "${NEW_ARTICLE_STATUS}" status found on this list (its statuses: ${statuses.join(', ') || 'none returned'})`);
+      }
+
+      const result = await createClickUpTask(info.topic, info.priority, ownerUserId, statusName);
       if (!result.id) {
-        await postThreadReply(SLACK_CHANNEL_ID, ts, `⚠️ Approval by <@${approver}> didn't complete: the ClickUp task was NOT created. ClickUp said: ${result.error}`);
+        await postThreadReply(SLACK_CHANNEL_ID, ts, `⚠️ Approval by <@${approver}> didn't complete: the ClickUp task was NOT created. ClickUp said: ${result.errors.join(' | ')}`);
         return { statusCode: 200, body: 'ClickUp task creation failed' };
+      }
+
+      if (result.lost.includes('status')) {
+        warnings.push(`couldn't set the status "${statusName}" (ClickUp said: ${result.errors[0]})`);
+      }
+
+      // If the owner couldn't be assigned at creation, try once more on its own
+      let assigned = !!ownerUserId && !result.lost.includes('owner');
+      if (ownerUserId && !assigned) {
+        const a = await assignTask(result.id, ownerUserId);
+        assigned = a.ok;
+        if (!a.ok) warnings.push(`couldn't assign the owner (ClickUp said: ${a.err})`);
+      }
+
+      if (option) {
+        const c = await setCategory(result.id, field, option);
+        if (!c.ok) warnings.push(`couldn't set the category (ClickUp said: ${c.err})`);
       }
 
       if (info.requester && info.description) {
@@ -280,10 +343,10 @@ exports.handler = async (event) => {
       }
 
       const parts = [`created ClickUp task *${info.topic}*`, 'description added as a comment'];
-      if (ownerMention && ownerUserId && !result.skipped) parts.push(`assigned to ${ownerMention}`);
+      if (statusName && !result.lost.includes('status')) parts.push(`status *${statusName}*`);
+      if (assigned && ownerMention) parts.push(`assigned to ${ownerMention}`);
       let reply = `✅ Approved by <@${approver}> — ${parts.join(', ')}.`;
-      if (result.skipped) reply += ` ⚠️ Couldn't set ${result.skipped} (ClickUp said: ${result.error}), so the task was created without ${result.skipped.startsWith('the NEW') ? 'it' : 'them'}.${ownerMention ? ` ${ownerMention} please check it.` : ''}`;
-      if (warnings.length) reply += ` ⚠️ ${warnings.join('; ')}.`;
+      if (warnings.length) reply += ` ⚠️ ${warnings.join('; ')}.${ownerMention ? ` ${ownerMention} please check it.` : ''}`;
       await postThreadReply(SLACK_CHANNEL_ID, ts, reply);
     }
 
