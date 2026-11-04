@@ -71,10 +71,14 @@ function priorityEmoji(p) {
 // Read the dropdown category name off a ClickUp task
 function getCategoryFromTask(task) {
   const field = (task.custom_fields || []).find(f => norm(f.name) === norm(CATEGORY_FIELD_NAME));
-  if (!field || field.value === undefined || field.value === null) return null;
+  if (!field || field.value === undefined || field.value === null) return [];
   const options = field.type_config?.options || [];
-  const opt = options.find(o => o.id === field.value || String(o.orderindex) === String(field.value));
-  return opt ? (opt.name ?? opt.label ?? null) : null;
+  // A "labels" field returns an array of option ids; a plain dropdown returns a single value
+  const values = Array.isArray(field.value) ? field.value : [field.value];
+  return values
+    .map(v => options.find(o => o.id === v || String(o.orderindex) === String(v)))
+    .map(opt => (opt ? (opt.name ?? opt.label ?? null) : null))
+    .filter(Boolean);
 }
 
 async function fetchAllTasks() {
@@ -152,8 +156,10 @@ exports.handler = async (event) => {
         // Look up the article's category → owner
         const taskRes = await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, { headers: CU });
         const task = await taskRes.json();
-        const taskCategory = getCategoryFromTask(task);
-        const owner = ownerFor(taskCategory);
+        const taskCategories = getCategoryFromTask(task); // array: the field can hold several categories
+        const mapped = taskCategories.find(c => OWNER_BY_CATEGORY[norm(c)]);
+        const owner = ownerFor(mapped || taskCategories[0] || null);
+        const taskCategory = taskCategories.join(', ');
 
         // Set priority on the existing task
         const prioRes = await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, {

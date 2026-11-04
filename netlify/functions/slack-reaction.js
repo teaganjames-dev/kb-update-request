@@ -169,7 +169,9 @@ async function postComment(taskId, text) {
 async function setCategory(taskId, field, option) {
   const url = `https://api.clickup.com/api/v2/task/${taskId}/field/${field.id}`;
   let lastErr = '';
-  for (const value of [option.id, option.orderindex]) {
+  // A "labels" field takes an array of option ids; a plain dropdown takes a single value
+  const candidates = field.type === 'labels' ? [[option.id]] : [option.id, option.orderindex];
+  for (const value of candidates) {
     if (value === undefined || value === null) continue;
     const res = await fetch(url, { method: 'POST', headers: CU, body: JSON.stringify({ value }) });
     if (res.ok) return { ok: true };
